@@ -1,111 +1,293 @@
+
 """
-src/search.py - Path aggregation, Best-of-N search, and compute-matched search.
+src/search.py - Path aggregation, Best-of-N search,
+and compute-matched self-consistency.
 """
+
+import time
 from typing import Any, Callable
+
+from .generation import (
+    compute_majority_vote,
+    run_self_consistency,
+)
+from .prm_judge import score_path
 
 GenerateFn = Callable[[str, int, dict], list[dict]]
 JudgeFn = Callable[[str], dict]
 
 
 def aggregate_path_score(
-    step_scores: list[float], 
-    strategy: str = "min", 
+    step_scores: list[float],
+    strategy: str = "min",
     penalty_lambda: float = 2.0
 ) -> float:
     """
-    Aggregates a list of step scores (+1.0 or -1.0) into a scalar trajectory score.
-    
-    Rules:
-      - An empty list returns -1.0 for every strategy.
-      - 'min': min(step_scores).
-      - 'product': p_t = clamp((r_t + 1)/2, 0.01, 0.99); returns the raw product.
-      - 'step_penalty': mean(step_scores) - penalty_lambda * count(r_t == -1.0).
-      - An unknown strategy raises ValueError.
+    Aggregate step-level rewards into one path score.
     """
-    # TODO: Implement min, product, and step_penalty aggregation
-    raise NotImplementedError("Implement aggregate_path_score in src/search.py")
+
+    if not step_scores:
+        return -1.0
+
+    if strategy == "min":
+        return float(min(step_scores))
+
+    if strategy == "product":
+        result = 1.0
+
+        for reward in step_scores:
+            probability = (reward + 1.0) / 2.0
+            probability = max(0.01, min(0.99, probability))
+            result *= probability
+
+        return float(result)
+
+    if strategy == "step_penalty":
+        mean_score = sum(step_scores) / len(step_scores)
+        invalid_count = sum(
+            reward == -1.0 for reward in step_scores
+        )
+
+        return float(
+            mean_score - penalty_lambda * invalid_count
+        )
+
+    raise ValueError(
+        f"Unknown aggregation strategy: {strategy}"
+    )
 
 
 def select_best_path(
-    candidate_paths: list[dict[str, Any]], 
-    aggregation_strategy: str = "min", 
+    candidate_paths: list[dict[str, Any]],
+    aggregation_strategy: str = "min",
     penalty_lambda: float = 2.0
 ) -> dict[str, Any]:
     """
-    Selects the winning candidate path from candidate_paths.
-    
-    Input Dictionary Contract:
-      Each candidate dictionary in candidate_paths must contain 'step_scores' (list[float])
-      and 'answer' (int | None). Any other keys present in the candidate dictionary
-      are passed through unchanged in the returned copy.
-    
-    Selection & Tie-Breaking Rules:
-      1. Compute path_score for each candidate with aggregate_path_score.
-         A candidate with an empty step_scores list gets -1.0.
-      2. Eligibility: if at least one candidate has a non-None answer, candidates
-         with answer=None are excluded. If all answers are None, all remain eligible.
-      3. Find maximum path_score among eligible candidates (tolerance 1e-9).
-         The tied set is all eligible candidates within tolerance of the maximum.
-      4. If the tied set has more than one candidate, compute compute_majority_vote
-         over their answers. Return the lowest-index candidate in the tied set whose
-         answer equals the vote. If the vote is None, return the lowest-index tied candidate.
-      5. Returns a shallow COPY of the chosen dict with two added keys:
-         'path_score' (float) and 'num_tied' (int, size of the tied set).
-         Does not mutate the inputs.
+    Select the best eligible candidate using PRM scores.
+    Break ties using majority vote.
     """
-    # TODO: Implement best path selection with answer=None filtering and majority tie-breaking
-    raise NotImplementedError("Implement select_best_path in src/search.py")
+
+    if not candidate_paths:
+        raise ValueError("candidate_paths cannot be empty")
+
+    scored_candidates = []
+
+    for candidate in candidate_paths:
+        path_score = aggregate_path_score(
+            candidate["step_scores"],
+            strategy=aggregation_strategy,
+            penalty_lambda=penalty_lambda
+        )
+
+        scored_candidates.append({
+            **candidate,
+            "path_score": path_score
+        })
+
+    has_valid_answer = any(
+        candidate.get("answer") is not None
+        for candidate in scored_candidates
+    )
+
+    if has_valid_answer:
+        eligible = [
+            candidate
+            for candidate in scored_candidates
+            if candidate.get("answer") is not None
+        ]
+    else:
+        eligible = scored_candidates
+
+    max_score = max(
+        candidate["path_score"]
+        for candidate in eligible
+    )
+
+    tied = [
+        candidate
+        for candidate in eligible
+        if abs(candidate["path_score"] - max_score) <= 1e-9
+    ]
+
+    if len(tied) == 1:
+        winner = tied[0]
+
+    else:
+        voted_answer = compute_majority_vote(
+            [candidate.get("answer") for candidate in tied]
+        )
+
+        winner = next(
+            (
+                candidate
+                for candidate in tied
+                if candidate.get("answer") == voted_answer
+            ),
+            tied[0]
+        )
+
+    return {
+        **winner,
+        "num_tied": len(tied)
+    }
 
 
 def run_prm_best_of_n(
-    model: Any = None, 
-    judge_model: Any = None, 
-    gen_tokenizer: Any = None, 
-    judge_tokenizer: Any = None, 
-    question: str = "", 
-    n: int = 5, 
-    aggregation_strategy: str = "min", 
-    penalty_lambda: float = 2.0, 
-    candidates: list[dict[str, Any]] | None = None, 
-    generate_fn: GenerateFn | None = None, 
+    model: Any = None,
+    judge_model: Any = None,
+    gen_tokenizer: Any = None,
+    judge_tokenizer: Any = None,
+    question: str = "",
+    n: int = 5,
+    aggregation_strategy: str = "min",
+    penalty_lambda: float = 2.0,
+    candidates: list[dict[str, Any]] | None = None,
+    generate_fn: GenerateFn | None = None,
     judge_fn: JudgeFn | None = None
 ) -> dict[str, Any]:
     """
-    Executes PRM-guided Best-of-N search over reasoning trajectories.
-    
-    If candidates is provided (shared candidate pool), does NOT sample new candidates
-    (generation_calls = 0, generated_tokens = 0). Provided candidates use the
-    run_self_consistency candidate format (at minimum 'steps' and 'answer').
-    Otherwise, samples n candidates using run_self_consistency.
-    
-    Scores each candidate's steps using score_path.
-    Selects the winning candidate via select_best_path.
-    
-    Returns:
-      selected, answer, candidates [each augmented with step_scores, rationales],
-      generation_calls, judge_calls, generated_tokens, judge_tokens, time_seconds
+    Generate or reuse candidate reasoning paths,
+    score each step with the PRM, and select the best.
     """
-    # TODO: Implement PRM Best-of-N search over candidate trajectories
-    raise NotImplementedError("Implement run_prm_best_of_n in src/search.py")
+
+    start_time = time.perf_counter()
+
+    if candidates is not None:
+        candidate_pool = [
+            dict(candidate) for candidate in candidates
+        ]
+
+        generation_calls = 0
+        generated_tokens = 0
+
+    else:
+        generation_result = run_self_consistency(
+            model=model,
+            tokenizer=gen_tokenizer,
+            question=question,
+            n=n,
+            generate_fn=generate_fn
+        )
+
+        candidate_pool = [
+            dict(candidate)
+            for candidate in generation_result["candidates"]
+        ]
+
+        generation_calls = generation_result["generation_calls"]
+        generated_tokens = generation_result["generated_tokens"]
+
+    judged_candidates = []
+    total_judge_calls = 0
+    total_judge_tokens = 0
+
+    for candidate in candidate_pool:
+
+        result = score_path(
+            judge_model=judge_model,
+            judge_tokenizer=judge_tokenizer,
+            question=question,
+            candidate=candidate,
+            judge_fn=judge_fn
+        )
+
+        scored_candidate = {
+            **candidate,
+            "step_scores": result["step_scores"],
+            "rationales": result["rationales"]
+        }
+
+        judged_candidates.append(scored_candidate)
+
+        total_judge_calls += result["judge_calls"]
+        total_judge_tokens += result["judge_tokens"]
+
+    selected = select_best_path(
+        judged_candidates,
+        aggregation_strategy=aggregation_strategy,
+        penalty_lambda=penalty_lambda
+    )
+
+    return {
+        "selected": selected,
+        "answer": selected.get("answer"),
+        "candidates": judged_candidates,
+        "generation_calls": generation_calls,
+        "judge_calls": total_judge_calls,
+        "generated_tokens": generated_tokens,
+        "judge_tokens": total_judge_tokens,
+        "time_seconds": float(
+            time.perf_counter() - start_time
+        )
+    }
 
 
 def run_compute_matched_self_consistency(
-    model: Any = None, 
-    tokenizer: Any = None, 
-    question: str = "", 
-    target_calls: int = 15, 
-    temperature: float = 0.7, 
-    existing_candidates: list[dict[str, Any]] | None = None, 
+    model: Any = None,
+    tokenizer: Any = None,
+    question: str = "",
+    target_calls: int = 15,
+    temperature: float = 0.7,
+    existing_candidates: list[dict[str, Any]] | None = None,
     generate_fn: GenerateFn | None = None
 ) -> dict[str, Any]:
     """
-    Executes compute-matched Self-Consistency aggregating target_calls paths.
-    If existing_candidates are supplied, samples only the deficit:
-    target_calls - len(existing_candidates). Returned candidates = existing_candidates followed by new samples, in sampling order.
-    
-    Returns:
-      candidates, answer, generation_calls (new samples only), total_samples,
-      generated_tokens (new samples only), time_seconds
+    Run self-consistency with a fixed generation budget.
+    Reuse existing candidates and generate only the deficit.
     """
-    # TODO: Implement compute-matched Self-Consistency with sample reuse
-    raise NotImplementedError("Implement run_compute_matched_self_consistency in src/search.py")
+
+    start_time = time.perf_counter()
+
+    existing = (
+        list(existing_candidates)
+        if existing_candidates is not None
+        else []
+    )
+
+    if target_calls < 0:
+        raise ValueError("target_calls cannot be negative")
+
+    if len(existing) > target_calls:
+        raise ValueError(
+            "Existing candidates exceed target_calls"
+        )
+
+    remaining = target_calls - len(existing)
+
+    new_candidates = []
+    generation_calls = 0
+    generated_tokens = 0
+
+    if remaining > 0:
+        result = run_self_consistency(
+            model=model,
+            tokenizer=tokenizer,
+            question=question,
+            n=remaining,
+            temperature=temperature,
+            generate_fn=generate_fn
+        )
+
+        new_candidates = result["candidates"]
+        generation_calls = result["generation_calls"]
+        generated_tokens = result["generated_tokens"]
+
+    all_candidates = existing + new_candidates
+
+    answer = compute_majority_vote(
+        [
+            candidate.get("answer")
+            for candidate in all_candidates
+        ]
+    )
+
+    return {
+        "candidates": all_candidates,
+        "answer": answer,
+        "generation_calls": generation_calls,
+        "total_samples": len(all_candidates),
+        "generated_tokens": generated_tokens,
+        "time_seconds": float(
+            time.perf_counter() - start_time
+        )
+    }
