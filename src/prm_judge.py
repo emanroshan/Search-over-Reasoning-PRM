@@ -1,72 +1,205 @@
+
 """
-src/prm_judge.py - PRM judge prompt construction, parsing, and step scoring.
+src/prm_judge.py
+PRM judge prompt construction, parsing, and step scoring.
 """
+
+import re
 from typing import Any, Callable
 
 JudgeFn = Callable[[str], dict]
-# judge_fn(judge_prompt) -> {"text": str, "num_tokens": int}
 
 
-def build_prm_judge_prompt(question: str, preceding_steps: list[str], current_step: str) -> str:
+def build_prm_judge_prompt(
+    question: str,
+    preceding_steps: list[str],
+    current_step: str
+) -> str:
     """
-    Builds the verification prompt for the PRM judge to classify current_step
-    as VALID or INVALID given the problem question and preceding_steps.
-    
-    Judge Semantics (Local Validity):
-    The judge evaluates current_step ASSUMING ALL PRECEDING STEPS ARE CORRECT.
-    A step is VALID if its arithmetic is sound and it follows logically from the
-    problem statement plus preceding steps as written. An error in an earlier step
-    does NOT make subsequent steps invalid by itself.
-    
-    Autograder Literal Checks:
-    - Preceding steps are rendered as 'Step 1: <text>', 'Step 2: <text>', ... in order.
-    - The current step is rendered with the label 'Current Step:'.
-    - The prompt contains the phrase 'assume all preceding steps are correct' (case-insensitive).
-    - The prompt contains the literal strings 'Verdict: VALID', 'Verdict: INVALID', and 'Rationale:'.
-    - With an empty preceding_steps list, the prompt states '(no preceding steps)'.
+    Build a judge prompt using local step validity.
     """
-    # TODO: Build verification prompt instructing 7B judge under local validity
-    raise NotImplementedError("Implement build_prm_judge_prompt in src/prm_judge.py")
+
+    if preceding_steps:
+        history = "\n".join(
+            f"Step {i}: {step}"
+            for i, step in enumerate(preceding_steps, start=1)
+        )
+    else:
+        history = "(no preceding steps)"
+
+    return (
+        "You are a mathematical reasoning verifier.\n"
+        "Your task is to judge ONLY the current reasoning step.\n\n"
+        "IMPORTANT: assume all preceding steps are correct.\n"
+        "Do not penalize the current step for mistakes in "
+        "earlier steps.\n"
+        "Check whether the current step follows logically "
+        "from the given question and preceding steps, "
+        "and whether its arithmetic is correct.\n\n"
+        f"Question:\n{question}\n\n"
+        f"Preceding Steps:\n{history}\n\n"
+        f"Current Step:\n{current_step}\n\n"
+        "Respond using exactly one of these verdicts:\n"
+        "Verdict: VALID\n"
+        "Verdict: INVALID\n"
+        "Rationale: <one short sentence explaining why>\n"
+    )
 
 
-def parse_judge_decision(judge_output: str) -> tuple[float, str]:
-    r"""
-    Parses the judge model's raw text completion into (score, rationale).
-    
-    Rules:
-      1. If a line matches /verdict\s*:\s*\**\s*(VALID|INVALID)\b/i, use it.
-         If several exist, use the first.
-      2. Otherwise, if standalone word INVALID or phrase 'NOT VALID' appears
-         (case-insensitive, word boundaries) -> -1.0.
-      3. Otherwise, if standalone word VALID appears -> +1.0.
-      4. Otherwise -> -1.0 (unparseable defaults to INVALID).
-      
-    Warning: A naive '"VALID" in text' check is wrong because "INVALID" contains "VALID".
-    
-    Rationale: Text after 'Rationale:' up to the first sentence end (".", "!", or "?"
-    followed by whitespace or end of string, so decimals like "2.5" are not split),
-    or a newline, whichever comes first, stripped. If absent, returns empty string "".
+def parse_judge_decision(
+    judge_output: str
+) -> tuple[float, str]:
     """
-    # TODO: Implement regex parsing for judge verdict and rationale
-    raise NotImplementedError("Implement parse_judge_decision in src/prm_judge.py")
+    Convert the judge response into a score and rationale.
+    VALID = +1.0, INVALID = -1.0.
+    """
+
+    if not isinstance(judge_output, str):
+        return -1.0, ""
+
+    explicit_verdict = re.search(
+        r"\bverdict\s*:\s*\**\s*(VALID|INVALID)\b",
+        judge_output,
+        flags=re.IGNORECASE
+    )
+
+    if explicit_verdict:
+        score = (
+            1.0
+            if explicit_verdict.group(1).upper() == "VALID"
+            else -1.0
+        )
+    elif re.search(
+        r"\bNOT\s+VALID\b|\bINVALID\b",
+        judge_output,
+        flags=re.IGNORECASE
+    ):
+        score = -1.0
+    elif re.search(
+        r"\bVALID\b",
+        judge_output,
+        flags=re.IGNORECASE
+    ):
+        score = 1.0
+    else:
+        score = -1.0
+
+    rationale_match = re.search(
+        r"\bRationale\s*:\s*([^\n]*)",
+        judge_output,
+        flags=re.IGNORECASE
+    )
+
+    rationale = ""
+
+    if rationale_match:
+        raw = rationale_match.group(1).strip()
+
+        first_sentence = re.search(
+            r"^.*?[.!?](?=\s|$)",
+            raw
+        )
+
+        rationale = (
+            first_sentence.group(0).strip()
+            if first_sentence
+            else raw
+        )
+
+    return score, rationale
 
 
 def score_path(
-    judge_model: Any = None, 
-    judge_tokenizer: Any = None, 
-    question: str = "", 
-    candidate: dict[str, Any] | None = None, 
+    judge_model: Any = None,
+    judge_tokenizer: Any = None,
+    question: str = "",
+    candidate: dict[str, Any] | None = None,
     judge_fn: JudgeFn | None = None
 ) -> dict[str, Any]:
     """
-    Sequentially scores each step in candidate["steps"] using judge_fn.
-    Step t is judged with preceding_steps = steps[:t].
-    
-    The student's code MUST call build_prm_judge_prompt to build the string passed to judge_fn,
-    and MUST call parse_judge_decision on the returned text.
-    
-    Returns:
-      step_scores, rationales, judge_calls, judge_tokens
+    Judge each reasoning step sequentially.
     """
-    # TODO: Implement sequential step scoring under local validity
-    raise NotImplementedError("Implement score_path in src/prm_judge.py")
+
+    steps = (candidate or {}).get("steps", [])
+
+    step_scores = []
+    rationales = []
+    judge_tokens = 0
+
+    for i, current_step in enumerate(steps):
+
+        preceding_steps = steps[:i]
+
+        prompt = build_prm_judge_prompt(
+            question,
+            preceding_steps,
+            current_step
+        )
+
+        if judge_fn is not None:
+            output = judge_fn(prompt)
+
+        else:
+            if judge_model is None or judge_tokenizer is None:
+                raise ValueError(
+                    "Provide a judge model/tokenizer or judge_fn."
+                )
+
+            import torch
+
+            messages = [
+                {"role": "user", "content": prompt}
+            ]
+
+            formatted_prompt = judge_tokenizer.apply_chat_template(
+                messages,
+                tokenize=False,
+                add_generation_prompt=True
+            )
+
+            inputs = judge_tokenizer(
+                formatted_prompt,
+                return_tensors="pt"
+            )
+
+            device = next(judge_model.parameters()).device
+
+            inputs = {
+                key: value.to(device)
+                for key, value in inputs.items()
+            }
+
+            input_length = inputs["input_ids"].shape[1]
+
+            with torch.inference_mode():
+                output_ids = judge_model.generate(
+                    **inputs,
+                    do_sample=False,
+                    max_new_tokens=96,
+                    pad_token_id=judge_tokenizer.eos_token_id
+                )
+
+            completion_ids = output_ids[0][input_length:]
+
+            output = {
+                "text": judge_tokenizer.decode(
+                    completion_ids,
+                    skip_special_tokens=True
+                ),
+                "num_tokens": len(completion_ids)
+            }
+
+        score, rationale = parse_judge_decision(
+            output["text"]
+        )
+
+        step_scores.append(score)
+        rationales.append(rationale)
+        judge_tokens += output["num_tokens"]
+
+    return {
+        "step_scores": step_scores,
+        "rationales": rationales,
+        "judge_calls": len(steps),
+        "judge_tokens": judge_tokens
+    }
