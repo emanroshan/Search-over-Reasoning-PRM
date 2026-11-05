@@ -1,11 +1,3 @@
-
-"""CS5326 PA3: reproducible, resumable 50-question GSM8K benchmark.
-
-Run from repository root:
-    python run_all.py --limit 1
-    python run_all.py --limit 5
-    python run_all.py --limit 50
-"""
 import argparse
 import json
 import time
