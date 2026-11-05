@@ -5,7 +5,8 @@ from .generation import (
     compute_majority_vote,
     run_self_consistency,
 )
-from .prm_judge import score_path
+from .prm_judge import score_path, build_prm_judge_prompt
+from .logprob import continuous_valid_probability
 
 GenerateFn = Callable[[str, int, dict], list[dict]]
 JudgeFn = Callable[[str], dict]
@@ -35,6 +36,21 @@ def aggregate_path_score(
             result *= probability
 
         return float(result)
+
+
+    if strategy == "product_logprob":
+        import math
+
+        if not all(
+            math.isfinite(float(p)) and 0 <= float(p) <= 1
+            for p in step_scores
+        ):
+            raise ValueError("Expected probabilities in [0, 1]")
+
+        return float(sum(
+            math.log(max(float(p), 1e-12))
+            for p in step_scores
+        ))
 
     if strategy == "step_penalty":
         mean_score = sum(step_scores) / len(step_scores)
@@ -67,8 +83,14 @@ def select_best_path(
     scored_candidates = []
 
     for candidate in candidate_paths:
+        scores = (
+            candidate["step_probabilities"]
+            if aggregation_strategy == "product_logprob"
+            else candidate["step_scores"]
+        )
+
         path_score = aggregate_path_score(
-            candidate["step_scores"],
+            scores,
             strategy=aggregation_strategy,
             penalty_lambda=penalty_lambda
         )
@@ -176,25 +198,38 @@ def run_prm_best_of_n(
     total_judge_tokens = 0
 
     for candidate in candidate_pool:
-
-        result = score_path(
-            judge_model=judge_model,
-            judge_tokenizer=judge_tokenizer,
-            question=question,
-            candidate=candidate,
-            judge_fn=judge_fn
-        )
-
-        scored_candidate = {
-            **candidate,
-            "step_scores": result["step_scores"],
-            "rationales": result["rationales"]
-        }
-
+        if aggregation_strategy == "product_logprob":
+            if judge_model is None or judge_tokenizer is None:
+                raise ValueError("product_logprob requires judge model and tokenizer")
+            steps = candidate.get("steps", [])
+            probabilities = []
+            for i, step in enumerate(steps):
+                prompt = build_prm_judge_prompt(question, steps[:i], step)
+                probabilities.append(
+                    continuous_valid_probability(judge_model, judge_tokenizer, prompt)
+                )
+            scored_candidate = {
+                **candidate,
+                "step_probabilities": probabilities,
+                "rationales": [],
+            }
+            total_judge_calls += len(steps)
+        else:
+            result = score_path(
+                judge_model=judge_model,
+                judge_tokenizer=judge_tokenizer,
+                question=question,
+                candidate=candidate,
+                judge_fn=judge_fn,
+            )
+            scored_candidate = {
+                **candidate,
+                "step_scores": result["step_scores"],
+                "rationales": result["rationales"],
+            }
+            total_judge_calls += result["judge_calls"]
+            total_judge_tokens += result["judge_tokens"]
         judged_candidates.append(scored_candidate)
-
-        total_judge_calls += result["judge_calls"]
-        total_judge_tokens += result["judge_tokens"]
 
     selected = select_best_path(
         judged_candidates,
