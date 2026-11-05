@@ -1,8 +1,4 @@
-
-"""
-src/prm_judge.py
-PRM judge prompt construction, parsing, and step scoring.
-"""
+"
 
 import re
 from typing import Any, Callable

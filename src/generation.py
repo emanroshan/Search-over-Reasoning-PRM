@@ -1,9 +1,3 @@
-
-"""
-src/generation.py
-Step-structured prompting and baseline generation routines.
-"""
-
 import time
 from typing import Any, Callable
 
@@ -13,9 +7,6 @@ from src.extraction import parse_steps, extract_answer
 GenerateFn = Callable[[str, int, dict], list[dict]]
 
 
-# --------------------------------------------------
-# 1. Step-structured prompt
-# --------------------------------------------------
 
 def format_step_prompt(question: str) -> str:
     """
@@ -42,10 +33,6 @@ def format_step_prompt(question: str) -> str:
     )
 
 
-# --------------------------------------------------
-# 2. Majority voting
-# --------------------------------------------------
-
 def compute_majority_vote(
     answers: list[int | None]
 ) -> int | None:
@@ -69,11 +56,6 @@ def compute_majority_vote(
             return answer
 
     return None
-
-
-# --------------------------------------------------
-# 3. Hugging Face generation helper
-# --------------------------------------------------
 
 def _generate_with_model(
     model: Any,
@@ -146,10 +128,6 @@ def _generate_with_model(
     return results
 
 
-# --------------------------------------------------
-# 4. Greedy decoding
-# --------------------------------------------------
-
 def run_greedy(
     model: Any = None,
     tokenizer: Any = None,
@@ -199,10 +177,6 @@ def run_greedy(
         "time_seconds": elapsed
     }
 
-
-# --------------------------------------------------
-# 5. Self-Consistency sampling
-# --------------------------------------------------
 
 def run_self_consistency(
     model: Any = None,

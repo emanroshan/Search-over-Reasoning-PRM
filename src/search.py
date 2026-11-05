@@ -1,9 +1,3 @@
-
-"""
-src/search.py - Path aggregation, Best-of-N search,
-and compute-matched self-consistency.
-"""
-
 import time
 from typing import Any, Callable
 

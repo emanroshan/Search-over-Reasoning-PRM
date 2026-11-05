@@ -1,14 +1,9 @@
-"""
-src/utils.py - Model loading, generation constants, seed management, and factories.
-"""
 import json
 import os
 from typing import Any, Callable
 
-# Global random seed specified by course policy
 GLOBAL_SEED = 5326
 
-# Sampling & decoding hyperparameter configurations
 GREEDY_GEN_KWARGS = {
     "do_sample": False,
     "temperature": None,

@@ -1,9 +1,4 @@
 
-"""
-src/extraction.py
-Parsing reasoning steps and final integer answers.
-"""
-
 import re
 
 
